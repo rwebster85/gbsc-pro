@@ -1274,7 +1274,7 @@ void setAndUpdateSogLevel(uint8_t level)
 // Function should not further nest, so it can be called in syncwatcher
 void goLowPowerWithInputDetection()
 {
-    if (rto->noSignalBlackScreenMode) {
+    if (uopt->keepOutputOnNoSignal && rto->noSignalBlackScreenMode) {
         // Keep DAC and sync output active so the TV stays locked and the OSD remains usable.
         // Just re-arm the sync processor to keep scanning for a real input signal.
         prepareSyncProcessor();
@@ -1283,6 +1283,7 @@ void goLowPowerWithInputDetection()
         LEDOFF;
         return;
     }
+
     GBS::OUT_SYNC_CNTRL::write(0); // no H / V sync out to PAD
     GBS::DAC_RGBS_PWDNZ::write(0); // direct disableDAC()
     //zeroAll();
@@ -7561,6 +7562,7 @@ void loadDefaultUserOptions()
     // HDMI Limited Range
     uopt->hdmiLimitedRange = 1;
     uopt->lastVideoStandard = 0;
+    uopt->keepOutputOnNoSignal = 0;
 }
 
 //RF_PRE_INIT() {
@@ -8017,6 +8019,10 @@ void setup()
             // ADV Hue
             uopt->advHue = (uint8_t)((f.read() - '0') * 100 + (f.read() - '0') * 10 + (f.read() - '0'));
             if (uopt->advHue > 254) uopt->advHue = 128;
+            uopt->lastVideoStandard = (uint8_t)(f.read() - '0');
+            if (uopt->lastVideoStandard > 9) uopt->lastVideoStandard = 0;
+            uopt->keepOutputOnNoSignal = (uint8_t)(f.read() - '0');
+            if (uopt->keepOutputOnNoSignal > 1) uopt->keepOutputOnNoSignal = 0;
 
             uopt->lastVideoStandard = (uint8_t)(f.read() - '0');
             if (uopt->lastVideoStandard > 9) uopt->lastVideoStandard = 0;
@@ -8135,7 +8141,7 @@ void setup()
         // Always output a stable signal when there is no input, so the TV stays locked and the
         // OSD is accessible via the remote.  If a previous session was detected, replicate its
         // exact format; otherwise fall back to a 1080p60 black screen (NTSC standard + Output1080P).
-        if (uopt->presetPreference != OutputBypass) {
+        if (uopt->keepOutputOnNoSignal && uopt->presetPreference != OutputBypass) {
             rto->noSignalBlackScreenMode = true;
             uint8_t noSignalStandard = (uopt->lastVideoStandard > 0) ? uopt->lastVideoStandard : 1;
             rto->videoStandardInput = noSignalStandard; // lets menu handlers use correct standard
@@ -8354,6 +8360,9 @@ void updateWebSocketData()
             }
             if (uopt->disableExternalClockGenerator) {
                 toSend[5] |= (1 << 2);
+            }
+            if (uopt->keepOutputOnNoSignal) {
+                toSend[5] |= (1 << 3);
             }
 
             // send ping and stats
@@ -9779,12 +9788,6 @@ void handleType2Command(char argument)
         case 'p':
         case 's':
         case 'L': {
-            // load preset via webui
-            uint8_t videoMode = getVideoMode();
-            if (videoMode == 0 && GBS::STATUS_SYNC_PROC_HSACT::read())
-                videoMode = rto->videoStandardInput; // last known good as fallback
-            //else videoMode stays 0 and we'll apply via some assumptions
-
             if (argument == 'f')
                 uopt->presetPreference = Output960P; // 1280x960
             if (argument == 'g')
@@ -9798,15 +9801,33 @@ void handleType2Command(char argument)
             // if (argument == 'L')
             //   uopt->presetPreference = OutputDownscale; // downscale
 
-            rto->useHdmiSyncFix = 1; // disables sync out when programming preset
-            if (rto->videoStandardInput == 14) {
-                // vga upscale path: let synwatcher handle it
-                rto->videoStandardInput = 15;
+            if (rto->sourceDisconnected) {
+                // No input signal — just save the preference
+                // If keepOutputOnNoSignal is ON, reload blank output at chosen resolution
+                saveUserPrefs();
+                if (uopt->keepOutputOnNoSignal) {
+                    uint8_t noSignalStandard = (uopt->lastVideoStandard > 0) ? uopt->lastVideoStandard : 1;
+                    rto->videoStandardInput = noSignalStandard;
+                    rto->noSignalBlackScreenMode = true;
+                    applyPresets(noSignalStandard);
+                }
             } else {
-                // normal path
-                applyPresets(videoMode);
+                // load preset via webui
+                uint8_t videoMode = getVideoMode();
+                if (videoMode == 0 && GBS::STATUS_SYNC_PROC_HSACT::read())
+                    videoMode = rto->videoStandardInput; // last known good as fallback
+                //else videoMode stays 0 and we'll apply via some assumptions
+
+                rto->useHdmiSyncFix = 1; // disables sync out when programming preset
+                if (rto->videoStandardInput == 14) {
+                    // vga upscale path: let synwatcher handle it
+                    rto->videoStandardInput = 15;
+                } else {
+                    // normal path
+                    applyPresets(videoMode);
+                }
+                saveUserPrefs();
             }
-            saveUserPrefs();
         } break;
         case 'i':
             // toggle active frametime lock method
@@ -10043,6 +10064,26 @@ void handleType2Command(char argument)
                 resetSyncProcessor();
                 delay(50);
                 applyVideoModePreset();
+            }
+            break;
+        case '|':
+            uopt->keepOutputOnNoSignal = !uopt->keepOutputOnNoSignal;
+            saveUserPrefs();
+
+            // Apply immediately if no source connected
+            if (rto->sourceDisconnected) {
+                if (uopt->keepOutputOnNoSignal) {
+                    // Turned ON — load blank preset at current resolution and keep signal
+                    uint8_t noSignalStandard = (uopt->lastVideoStandard > 0) ? uopt->lastVideoStandard : 1;
+                    rto->videoStandardInput = noSignalStandard;
+                    rto->noSignalBlackScreenMode = true;
+                    applyPresets(noSignalStandard); // loads the blank preset
+                } else {
+                    // Turned OFF — kill output and revert to old behavior
+                    rto->noSignalBlackScreenMode = false;
+                    rto->isInLowPowerMode = false;
+                    goLowPowerWithInputDetection(); // normal path, kills DAC
+                }
             }
             break;
         case 'z':
@@ -11428,6 +11469,7 @@ void saveUserPrefs()
     f.write((uopt->advHue / 10) % 10 + '0');
     f.write(uopt->advHue % 10 + '0');
     f.write(uopt->lastVideoStandard + '0');
+    f.write(uopt->keepOutputOnNoSignal + '0');
     f.close();
 }
 
